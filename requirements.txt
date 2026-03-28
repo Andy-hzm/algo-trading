@@ -1,0 +1,6 @@
+polygon-api-client
+python-dotenv
+pandas
+pyarrow
+boto3
+ipykernel
