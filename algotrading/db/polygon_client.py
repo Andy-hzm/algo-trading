@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Union
 
 import pandas as pd
+import urllib3
 from polygon import RESTClient
 from polygon.exceptions import BadResponse
 
@@ -34,6 +35,13 @@ class PolygonClient:
         if not api_key:
             raise ValueError("POLYGON_API_KEY not set")
         self._client = RESTClient(api_key=api_key)
+        # Increase connection pool to match thread count — prevents
+        # "Connection pool is full" warnings under heavy threading
+        self._client.client = urllib3.PoolManager(
+            num_pools=max_workers,
+            maxsize=max_workers,
+            headers=self._client.headers,
+        )
         self.max_workers = max_workers
 
     # ------------------------------------------------------------------

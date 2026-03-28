@@ -1,11 +1,11 @@
 import os
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
+from typing import List
 
 import boto3
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
@@ -16,13 +16,19 @@ class S3Client:
     Read/write Parquet files on S3.
 
     Layout:
-        s3://{bucket}/
-        ├── dim/tickers.parquet                          ← ticker universe
-        └── bars/hourly/year={YYYY}/month={MM}/data.parquet  ← OHLCV bars
+        s3://{bucket}/{prefix}/
+        ├── dim/tickers.parquet
+        └── bars/hourly/ticker={TICKER}/year={YYYY}/month={MM}/data.parquet
+
+    Partitioned by ticker then time — each ticker owns its own files so
+    parallel writes never conflict. Batched writes reduce S3 PUT count.
+
+    Use prefix='prod' for real data, prefix='dev' for experiments.
     """
 
-    def __init__(self, bucket: str = None, region: str = None):
+    def __init__(self, bucket: str = None, region: str = None, prefix: str = "prod"):
         self.bucket = bucket or os.environ["S3_BUCKET"]
+        self.prefix = prefix
         self._s3 = boto3.client(
             "s3",
             region_name=region or os.environ.get("AWS_REGION", "us-east-1"),
@@ -30,18 +36,18 @@ class S3Client:
 
     @property
     def _dim_key(self):
-        return "dim/tickers.parquet"
+        return f"{self.prefix}/dim/tickers.parquet"
 
     @property
     def _bars_prefix(self):
-        return "bars/hourly"
+        return f"{self.prefix}/bars/hourly"
 
     # ------------------------------------------------------------------
     # Dim table
     # ------------------------------------------------------------------
 
     def write_dim(self, df: pd.DataFrame) -> None:
-        """Write ticker dim table to s3://{bucket}/{env}/dim/tickers.parquet"""
+        """Write ticker dim table to s3://{bucket}/{prefix}/dim/tickers.parquet"""
         self._write_parquet(df, self._dim_key)
         logger.info(f"Wrote dim table ({len(df)} rows) → s3://{self.bucket}/{self._dim_key}")
 
@@ -50,64 +56,83 @@ class S3Client:
         return self._read_parquet(self._dim_key)
 
     # ------------------------------------------------------------------
-    # Bars
+    # Bars — write
     # ------------------------------------------------------------------
 
-    def write_bars(self, df: pd.DataFrame) -> None:
+    def write_bars_batch(self, df: pd.DataFrame, max_workers: int = 20) -> None:
         """
-        Write OHLCV bars to S3, partitioned by year/month.
+        Write a batch of OHLCV bars (multiple tickers) to S3 in parallel.
+
+        Layout: ticker={TICKER}/year={YYYY}/month={MM}/data.parquet
+        Each ticker writes to its own files — no conflicts between parallel workers.
+        S3 PUTs are issued concurrently via ThreadPoolExecutor.
 
         Expects df indexed by UTC timestamp with a 'ticker' column.
-        Splits into monthly partitions and writes each separately.
+        Always overwrites — caller is responsible for dedup if needed.
         """
         if df.empty:
             return
 
         df = df.copy()
-        df["year"] = df.index.year
-        df["month"] = df.index.month
+        df["_year"] = df.index.year
+        df["_month"] = df.index.month
 
-        for (year, month), chunk in df.groupby(["year", "month"]):
-            key = f"{self._bars_prefix}/year={year}/month={month:02d}/data.parquet"
-            # If partition already exists, merge with existing data
-            existing = self._read_parquet(key)
-            if not existing.empty:
-                chunk = chunk.drop(columns=["year", "month"])
-                combined = pd.concat([existing, chunk])
-                combined = combined[~combined.index.duplicated(keep="last")]
-                combined = combined.sort_index()
-            else:
-                chunk = chunk.drop(columns=["year", "month"])
-                combined = chunk
+        # Build list of (key, chunk) pairs to write
+        writes = []
+        for (ticker, year, month), chunk in df.groupby(["ticker", "_year", "_month"]):
+            key = f"{self._bars_prefix}/ticker={ticker}/year={year}/month={month:02d}/data.parquet"
+            writes.append((key, chunk.drop(columns=["_year", "_month"])))
 
-            self._write_parquet(combined, key)
-            logger.info(f"Wrote {len(combined)} rows → s3://{self.bucket}/{key}")
+        # Issue all S3 PUTs in parallel
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._write_parquet, chunk, key): key for key, chunk in writes}
+            for future in as_completed(futures):
+                future.result()  # raise if any write failed
 
-    def read_bars(self, start: str, end: str) -> pd.DataFrame:
+        tickers = df["ticker"].nunique()
+        logger.info(f"Wrote {len(df)} rows ({tickers} tickers, {len(writes)} partitions) → {self._bars_prefix}/")
+
+    # ------------------------------------------------------------------
+    # Bars — read
+    # ------------------------------------------------------------------
+
+    def read_bars(self, start: str, end: str, tickers: List[str] = None) -> pd.DataFrame:
         """
-        Read bars for a date range by loading only the relevant partitions.
+        Read bars for a date range.
 
         Args:
-            start: 'YYYY-MM-DD'
-            end:   'YYYY-MM-DD'
+            start:   'YYYY-MM-DD'
+            end:     'YYYY-MM-DD'
+            tickers: list of ticker symbols to load. If None, loads all tickers
+                     (slower — scans all ticker partitions).
 
         Returns a DataFrame indexed by UTC timestamp.
         """
         start_dt = pd.Timestamp(start, tz="UTC")
         end_dt = pd.Timestamp(end, tz="UTC")
 
-        keys = self._partition_keys(start_dt, end_dt)
+        if tickers is None:
+            tickers = self._list_tickers()
+
+        keys = []
+        for ticker in tickers:
+            keys.extend(self._ticker_partition_keys(ticker, start_dt, end_dt))
+
         frames = []
         for key in keys:
-            df = self._read_parquet(key)
-            if not df.empty:
-                frames.append(df)
+            chunk = self._read_parquet(key)
+            if not chunk.empty:
+                frames.append(chunk)
 
         if not frames:
             return pd.DataFrame()
 
         df = pd.concat(frames).sort_index()
         return df.loc[start_dt:end_dt]
+
+    def read_ticker(self, ticker: str, start: str, end: str) -> pd.DataFrame:
+        """Convenience method to read a single ticker."""
+        return self.read_bars(start, end, tickers=[ticker])
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -129,12 +154,23 @@ class S3Client:
                 return pd.DataFrame()
             raise
 
-    def _partition_keys(self, start: pd.Timestamp, end: pd.Timestamp) -> list:
-        """Generate all year/month partition keys between start and end."""
+    def _ticker_partition_keys(self, ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> list:
         keys = []
         current = start.replace(day=1)
         while current <= end:
-            key = f"{self._bars_prefix}/year={current.year}/month={current.month:02d}/data.parquet"
+            key = f"{self._bars_prefix}/ticker={ticker}/year={current.year}/month={current.month:02d}/data.parquet"
             keys.append(key)
             current += pd.DateOffset(months=1)
         return keys
+
+    def _list_tickers(self) -> list:
+        """List all ticker prefixes available in S3."""
+        prefix = f"{self._bars_prefix}/ticker="
+        paginator = self._s3.get_paginator("list_objects_v2")
+        tickers = set()
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix, Delimiter="/"):
+            for cp in page.get("CommonPrefixes", []):
+                # cp['Prefix'] = 'prod/bars/hourly/ticker=AAPL/'
+                ticker = cp["Prefix"].rstrip("/").split("ticker=")[-1]
+                tickers.add(ticker)
+        return sorted(tickers)
