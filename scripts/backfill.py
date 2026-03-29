@@ -24,8 +24,8 @@ from dotenv import load_dotenv
 load_dotenv()
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from algotrading.db.polygon_client import PolygonClient
-from algotrading.db.s3_client import S3Client
+from algotrading.infra.polygon_client import PolygonClient
+from algotrading.infra.s3_client import S3Client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,8 +38,8 @@ logger = logging.getLogger(__name__)
 
 def _fetch_batch(args):
     batch, start, end, env = args
-    from algotrading.db.polygon_client import PolygonClient
-    from algotrading.db.s3_client import S3Client
+    from algotrading.infra.polygon_client import PolygonClient
+    from algotrading.infra.s3_client import S3Client
 
     pc = PolygonClient()          # threaded inside: 10 concurrent requests
     s3 = S3Client(prefix=env)
