@@ -6,9 +6,10 @@ A Python package for algorithmic trading research — price pattern detection, r
 
 ```
 algotrading/
-├── db/
+├── infra/
 │   ├── polygon_client.py   # fetch OHLCV bars from Polygon.io
-│   └── s3_client.py        # read/write Parquet data on S3
+│   ├── s3_client.py        # read/write Parquet data on S3
+│   └── ec2_runner.py       # start/stop EC2, run backfill remotely
 └── backtest/
     ├── signal.py            # signal generation (BaseSignal + implementations)
     ├── portfolio.py         # walk-forward simulation
