@@ -45,6 +45,7 @@ def main():
     # Build the backfill command — identical to running it locally
     cmd = (
         f"cd {runner.REPO_DIR} && git pull && "
+        f"{runner.REPO_DIR}/.venv/bin/pip install -q {runner.REPO_DIR} && "
         f"POLYGON_API_KEY={os.environ['POLYGON_API_KEY']} "
         f"S3_BUCKET={os.environ['S3_BUCKET']} "
         f"AWS_ACCESS_KEY_ID={os.environ['AWS_ACCESS_KEY_ID']} "
