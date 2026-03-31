@@ -1,5 +1,5 @@
 """
-Run backfill on EC2 via SSM. No SSH needed.
+Run backfill on EC2 via SSM. Code is synced via S3 (no GitHub/SSH needed).
 
 Usage:
     python scripts/run_ec2.py                          # full backfill, prod
@@ -11,8 +11,11 @@ Usage:
 import argparse
 import logging
 import os
+import subprocess
 import sys
+from io import BytesIO
 
+import boto3
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -21,6 +24,33 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from algotrading.infra.ec2_runner import EC2Runner
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+logger = logging.getLogger(__name__)
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CODE_S3_KEY = "code/code.zip"
+
+
+def upload_code(bucket: str) -> None:
+    """Zip local code and upload to S3."""
+    import zipfile, tempfile
+    logger.info("Uploading code to S3...")
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            for base in ["algotrading", "scripts"]:
+                for dirpath, _, filenames in os.walk(os.path.join(ROOT, base)):
+                    for fname in filenames:
+                        if fname.endswith(".pyc"):
+                            continue
+                        fpath = os.path.join(dirpath, fname)
+                        zf.write(fpath, os.path.relpath(fpath, ROOT))
+            for f in ["pyproject.toml", "requirements.txt"]:
+                zf.write(os.path.join(ROOT, f), f)
+        tmp_path = tmp.name
+
+    s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+    s3.upload_file(tmp_path, bucket, CODE_S3_KEY)
+    os.unlink(tmp_path)
+    logger.info(f"Code uploaded to s3://{bucket}/{CODE_S3_KEY}")
 
 
 def main():
@@ -36,16 +66,24 @@ def main():
     parser.add_argument("--no-stop",    action="store_true", help="Keep instance running after job completes")
     args = parser.parse_args()
 
+    bucket = os.environ["S3_BUCKET"]
+
     runner = EC2Runner()
     runner.start()
 
     if args.setup:
         runner.setup()
 
-    # Build the backfill command — identical to running it locally
+    # Upload current local code to S3, EC2 pulls it down
+    upload_code(bucket)
+    runner.run(
+        f"aws s3 cp s3://{bucket}/{CODE_S3_KEY} /tmp/code.zip && "
+        f"unzip -o /tmp/code.zip -d {runner.REPO_DIR} && "
+        f"{runner.REPO_DIR}/.venv/bin/pip install -q {runner.REPO_DIR}"
+    )
+
     cmd = (
-        f"cd {runner.REPO_DIR} && git pull && "
-        f"{runner.REPO_DIR}/.venv/bin/pip install -q {runner.REPO_DIR} && "
+        f"cd {runner.REPO_DIR} && "
         f"POLYGON_API_KEY='{os.environ['POLYGON_API_KEY']}' "
         f"S3_BUCKET='{os.environ['S3_BUCKET']}' "
         f"AWS_ACCESS_KEY_ID='{os.environ['AWS_ACCESS_KEY_ID']}' "

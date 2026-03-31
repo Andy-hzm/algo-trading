@@ -81,7 +81,7 @@ class S3Client:
         writes = []
         for (ticker, year, month), chunk in df.groupby(["ticker", "_year", "_month"]):
             key = f"{self._bars_prefix}/ticker={ticker}/year={year}/month={month:02d}/data.parquet"
-            writes.append((key, chunk.drop(columns=["_year", "_month"])))
+            writes.append((key, chunk.drop(columns=["ticker", "_year", "_month"])))
 
         # Issue all S3 PUTs in parallel
         with ThreadPoolExecutor(max_workers=max_workers) as executor:

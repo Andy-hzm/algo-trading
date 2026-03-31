@@ -45,6 +45,7 @@ def _fetch_batch(args):
     s3 = S3Client(prefix=env)
 
     df = pc.get_bars_bulk(batch, start, end)   # fetch all tickers in batch
+    print(f"Batch of {len(batch)} tickers — {len(df)} rows fetched")
     if not df.empty:
         s3.write_bars_batch(df)                # one S3 PUT per (ticker, month)
         logger.info(f"Batch of {len(batch)} tickers — {len(df)} rows written")
