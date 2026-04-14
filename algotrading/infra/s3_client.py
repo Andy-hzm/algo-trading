@@ -26,7 +26,7 @@ class S3Client:
     Use prefix='prod' for real data, prefix='dev' for experiments.
     """
 
-    def __init__(self, bucket: str = None, region: str = None, prefix: str = "prod"):
+    def __init__(self, bucket: str = None, region: str = None, prefix: str = "algotrading/prod"):
         self.bucket = bucket or os.environ["S3_BUCKET"]
         self.prefix = prefix
         self._s3 = boto3.client(
@@ -41,6 +41,10 @@ class S3Client:
     @property
     def _bars_prefix(self):
         return f"{self.prefix}/bars/hourly"
+
+    @property
+    def _financials_prefix(self):
+        return f"{self.prefix}/financials"
 
     # ------------------------------------------------------------------
     # Dim table
@@ -91,6 +95,124 @@ class S3Client:
 
         tickers = df["ticker"].nunique()
         logger.info(f"Wrote {len(df)} rows ({tickers} tickers, {len(writes)} partitions) → {self._bars_prefix}/")
+
+    # ------------------------------------------------------------------
+    # Bars — read
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Financials — write / read
+    # ------------------------------------------------------------------
+
+    def write_financials_batch(self, df: pd.DataFrame, max_workers: int = 20) -> None:
+        """
+        Write financials in dual layout:
+          by_ticker: financials/by_ticker/ticker={T}/data.parquet
+          by_time:   financials/by_time/year={Y}/data.parquet  (sorted by ticker)
+        """
+        if df.empty:
+            return
+
+        writes = []
+
+        for ticker, chunk in df.groupby("ticker"):
+            key = f"{self._financials_prefix}/by_ticker/ticker={ticker}/data.parquet"
+            writes.append((key, chunk.drop(columns=["ticker"]).sort_values("filing_date")))
+
+        df["_year"] = pd.to_datetime(df["filing_date"]).dt.year
+        for year, chunk in df.groupby("_year"):
+            key = f"{self._financials_prefix}/by_time/year={year}/data.parquet"
+            writes.append((key, chunk.drop(columns=["_year"]).sort_values("ticker")))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._write_parquet, chunk, key): key for key, chunk in writes}
+            for future in as_completed(futures):
+                future.result()
+
+        logger.info(f"Wrote {len(df)} financials rows ({df['ticker'].nunique()} tickers) → {self._financials_prefix}/")
+
+    def read_daily_all(
+        self,
+        start_year: int = 2016,
+        end_year: int = 2026,
+        max_workers: int = 16,
+    ) -> pd.DataFrame:
+        """
+        Read all daily bars from the daily layout in parallel.
+
+        Layout: {prefix}/bars/daily/year={Y}/month={M}/data.parquet
+        Each file contains all tickers for that month.
+
+        Returns a DataFrame with columns: ticker, timestamp, open, high, low, close, volume, vwap
+        """
+        daily_prefix = f"{self.prefix}/bars/daily"
+        keys = [
+            f"{daily_prefix}/year={y}/month={m:02d}/data.parquet"
+            for y in range(start_year, end_year + 1)
+            for m in range(1, 13)
+        ]
+
+        frames = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._read_parquet, key): key for key in keys}
+            for future in as_completed(futures):
+                chunk = future.result()
+                if not chunk.empty:
+                    frames.append(chunk)
+
+        if not frames:
+            return pd.DataFrame()
+
+        df = pd.concat(frames, ignore_index=True)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        return df.sort_values(["timestamp", "ticker"]).reset_index(drop=True)
+
+    def read_financials_all(self, start_year: int = 2016, end_year: int = 2025) -> pd.DataFrame:
+        """
+        Read all financials from by_time layout — one S3 read per year.
+        Much faster than read_financials() for cross-sectional analysis.
+        """
+        frames = []
+        for year in range(start_year, end_year + 1):
+            key = f"{self._financials_prefix}/by_time/year={year}/data.parquet"
+            chunk = self._read_parquet(key)
+            if not chunk.empty:
+                frames.append(chunk)
+
+        if not frames:
+            return pd.DataFrame()
+
+        df = pd.concat(frames, ignore_index=True)
+        df["filing_date"] = pd.to_datetime(df["filing_date"])
+        return df
+
+    def read_financials(self, tickers: List[str], start: str = None, end: str = None) -> pd.DataFrame:
+        """
+        Read financials from by_ticker layout.
+
+        Args:
+            tickers: list of tickers to load.
+            start:   filter filing_date >= start ('YYYY-MM-DD')
+            end:     filter filing_date <= end ('YYYY-MM-DD')
+        """
+        frames = []
+        for ticker in tickers:
+            key = f"{self._financials_prefix}/by_ticker/ticker={ticker}/data.parquet"
+            chunk = self._read_parquet(key)
+            if not chunk.empty:
+                chunk.insert(0, "ticker", ticker)
+                frames.append(chunk)
+
+        if not frames:
+            return pd.DataFrame()
+
+        df = pd.concat(frames, ignore_index=True)
+        df["filing_date"] = pd.to_datetime(df["filing_date"])
+        if start:
+            df = df[df["filing_date"] >= pd.Timestamp(start)]
+        if end:
+            df = df[df["filing_date"] <= pd.Timestamp(end)]
+        return df.sort_values(["ticker", "filing_date"]).reset_index(drop=True)
 
     # ------------------------------------------------------------------
     # Bars — read

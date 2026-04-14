@@ -62,7 +62,7 @@ def main():
     parser.add_argument("--tickers",    nargs="+", default=None)
     parser.add_argument("--workers",    type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=50)
-    parser.add_argument("--env",        default="prod", choices=["prod", "dev"])
+    parser.add_argument("--env",        default="algotrading/prod", choices=["algotrading/prod", "algotrading/dev"])
     parser.add_argument("--write-dim",  action="store_true")
     args = parser.parse_args()
 

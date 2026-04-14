@@ -4,3 +4,4 @@ pandas
 pyarrow
 boto3
 ipykernel
+yfinance

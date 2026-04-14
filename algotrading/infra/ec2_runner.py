@@ -55,8 +55,6 @@ class EC2Runner:
         First-time setup: install Python, clone repo, install dependencies.
         Run once on a fresh instance.
         """
-        # Single command string — SSM runs each list item in a separate shell,
-        # so chaining with && keeps everything in one shell session
         command = (
             "sudo dnf install -y python3.11 python3.11-pip git && "
             f"(git clone {self.REPO_URL} {self.REPO_DIR} 2>/dev/null || git -C {self.REPO_DIR} pull) && "
@@ -76,7 +74,7 @@ class EC2Runner:
     def run(self, commands: list | str, timeout: int = 3600) -> None:
         """
         Run one or more shell commands on the instance via SSM.
-        Streams output back to the logger.
+        Prints output when the command completes.
 
         Args:
             commands: a single command string or list of commands

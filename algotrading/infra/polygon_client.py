@@ -115,6 +115,99 @@ class PolygonClient:
 
         return pd.concat(frames).sort_index()
 
+    def get_financials(
+        self,
+        ticker: str,
+        start: DateLike,
+        end: DateLike,
+        timeframe: str = "quarterly",
+    ) -> pd.DataFrame:
+        """
+        Fetch fundamental financials for a single ticker.
+
+        Args:
+            ticker:    Ticker symbol.
+            start:     Start date (filing_date >= start).
+            end:       End date (filing_date <= end).
+            timeframe: 'quarterly' | 'annual'
+
+        Returns a DataFrame with one row per filing, columns include:
+            ticker, period_of_report_date, filing_date, timeframe,
+            and flattened financial statement fields (revenues, net_income, etc.)
+        """
+        rows = []
+        try:
+            for f in self._client.vx.list_stock_financials(
+                ticker=ticker,
+                timeframe=timeframe,
+                filing_date_gte=self._to_str(start),
+                filing_date_lte=self._to_str(end),
+                limit=100,
+            ):
+                row = {
+                    "ticker": ticker,
+                    "period_start_date": f.start_date,
+                    "period_end_date": f.end_date,
+                    "filing_date": f.filing_date,
+                    "timeframe": timeframe,
+                    "fiscal_year": f.fiscal_year,
+                    "fiscal_period": f.fiscal_period,
+                }
+                # Flatten financials: income_statement, balance_sheet, cash_flow_statement
+                for stmt_name in ["income_statement", "balance_sheet", "cash_flow_statement"]:
+                    stmt = getattr(f.financials, stmt_name, None)
+                    if stmt:
+                        for field, val in vars(stmt).items():
+                            if val is not None and hasattr(val, "value") and val.value is not None:
+                                row[f"{stmt_name}__{field}"] = val.value
+                rows.append(row)
+        except Exception as e:
+            logger.error(f"Financials fetch failed for {ticker}: {e}")
+            return pd.DataFrame()
+
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        df["filing_date"] = pd.to_datetime(df["filing_date"])
+        df["period_start_date"] = pd.to_datetime(df["period_start_date"])
+        df["period_end_date"] = pd.to_datetime(df["period_end_date"])
+        return df.sort_values("filing_date").reset_index(drop=True)
+
+    def get_financials_bulk(
+        self,
+        tickers: List[str],
+        start: DateLike,
+        end: DateLike,
+        timeframe: str = "quarterly",
+    ) -> pd.DataFrame:
+        """Fetch financials for multiple tickers using threads."""
+        frames = []
+        failed = []
+
+        def _fetch(ticker):
+            return ticker, self.get_financials(ticker, start, end, timeframe)
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(_fetch, t): t for t in tickers}
+            for i, future in enumerate(as_completed(futures)):
+                ticker = futures[future]
+                try:
+                    _, df = future.result()
+                    if not df.empty:
+                        frames.append(df)
+                    logger.info(f"[{i+1}/{len(tickers)}] {ticker} — {len(df)} filings")
+                except Exception as e:
+                    logger.error(f"{ticker} failed: {e}")
+                    failed.append(ticker)
+
+        if failed:
+            logger.warning(f"{len(failed)} tickers failed: {failed}")
+        if not frames:
+            return pd.DataFrame()
+
+        return pd.concat(frames, ignore_index=True)
+
     def get_tickers(
         self,
         exchanges: List[str] = None,

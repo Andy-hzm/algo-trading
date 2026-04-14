@@ -1,11 +1,13 @@
 """
-Run backfill on EC2 via SSM. Code is synced via S3 (no GitHub/SSH needed).
+Run jobs on EC2 via SSM. Code is synced via S3 (no GitHub/SSH needed).
 
 Usage:
     python scripts/run_ec2.py                          # full backfill, prod
     python scripts/run_ec2.py --setup                  # first-time setup
     python scripts/run_ec2.py --env dev --tickers AAPL MSFT
     python scripts/run_ec2.py --no-stop                # keep instance running after job
+    python scripts/run_ec2.py --job resample-daily     # resample hourly → daily
+    python scripts/run_ec2.py --job resample-daily --year 2020
 """
 
 import argparse
@@ -55,12 +57,17 @@ def upload_code(bucket: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--job",        default="backfill", choices=["backfill", "resample-daily"])
     parser.add_argument("--start",      default="2016-03-30")
     parser.add_argument("--end",        default="2026-03-27")
-    parser.add_argument("--env",        default="prod", choices=["prod", "dev"])
+    parser.add_argument("--env",        default="algotrading/prod")
     parser.add_argument("--workers",    type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--tickers",    nargs="+", default=None)
+    parser.add_argument("--year",       default=None)
+    parser.add_argument("--month",      default=None)
+    parser.add_argument("--start-year", default=None)
+    parser.add_argument("--end-year",   default=None)
     parser.add_argument("--write-dim",  action="store_true")
     parser.add_argument("--setup",      action="store_true", help="Run first-time setup on the instance")
     parser.add_argument("--no-stop",    action="store_true", help="Keep instance running after job completes")
@@ -82,23 +89,38 @@ def main():
         f"{runner.REPO_DIR}/.venv/bin/pip install -q {runner.REPO_DIR}"
     )
 
-    cmd = (
-        f"cd {runner.REPO_DIR} && "
-        f"POLYGON_API_KEY='{os.environ['POLYGON_API_KEY']}' "
+    env_vars = (
         f"S3_BUCKET='{os.environ['S3_BUCKET']}' "
         f"AWS_ACCESS_KEY_ID='{os.environ['AWS_ACCESS_KEY_ID']}' "
         f"AWS_SECRET_ACCESS_KEY='{os.environ['AWS_SECRET_ACCESS_KEY']}' "
         f"AWS_REGION='{os.environ.get('AWS_REGION', 'us-east-1')}' "
-        f"{runner.REPO_DIR}/.venv/bin/python scripts/backfill.py "
-        f"--start {args.start} --end {args.end} --env {args.env} "
-        f"--workers {args.workers} --batch-size {args.batch_size}"
     )
-    if args.write_dim:
-        cmd += " --write-dim"
-    if args.tickers:
-        cmd += f" --tickers {' '.join(args.tickers)}"
+    base = f"cd {runner.REPO_DIR} && {env_vars} {runner.REPO_DIR}/.venv/bin/python"
 
-    runner.run(cmd)
+    if args.job == "backfill":
+        cmd = (
+            f"{base} scripts/backfill.py "
+            f"--start {args.start} --end {args.end} --env {args.env} "
+            f"--workers {args.workers} --batch-size {args.batch_size}"
+        )
+        if args.write_dim:
+            cmd += " --write-dim"
+        if args.tickers:
+            cmd += f" --tickers {' '.join(args.tickers)}"
+        cmd = f"POLYGON_API_KEY='{os.environ['POLYGON_API_KEY']}' " + cmd
+
+    elif args.job == "resample-daily":
+        cmd = f"{base} scripts/resample_daily.py --env {args.env} --workers 8"
+        if args.year:
+            cmd += f" --year {args.year}"
+        if args.month:
+            cmd += f" --month {args.month}"
+        if args.start_year:
+            cmd += f" --start-year {args.start_year}"
+        if args.end_year:
+            cmd += f" --end-year {args.end_year}"
+
+    runner.run(cmd, timeout=7200)
 
     if not args.no_stop:
         runner.stop()
