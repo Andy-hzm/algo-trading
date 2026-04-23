@@ -29,9 +29,11 @@ class S3Client:
     def __init__(self, bucket: str = None, region: str = None, prefix: str = "algotrading/prod"):
         self.bucket = bucket or os.environ["S3_BUCKET"]
         self.prefix = prefix
+        from botocore.config import Config
         self._s3 = boto3.client(
             "s3",
             region_name=region or os.environ.get("AWS_REGION", "us-east-1"),
+            config=Config(max_pool_connections=50),
         )
 
     @property
@@ -58,6 +60,105 @@ class S3Client:
     def read_dim(self) -> pd.DataFrame:
         """Read ticker dim table from S3. Returns empty DataFrame if not found."""
         return self._read_parquet(self._dim_key)
+
+    def read_ff_factors(self) -> pd.DataFrame:
+        """Read Fama-French factors (MKT-RF, SMB, HML, RF, UMD) from S3."""
+        key = f"{self.prefix}/dim/ff_factors.parquet"
+        df = self._read_parquet(key)
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"])
+        return df
+
+    # ------------------------------------------------------------------
+    # Sharadar
+    # ------------------------------------------------------------------
+
+    def read_sharadar_sf1(self) -> pd.DataFrame:
+        """Read SHARADAR/SF1 ARQ fundamentals. Columns: ticker, datekey, calendardate, ..."""
+        key = f"{self.prefix}/sharadar/sf1.parquet"
+        df = self._read_parquet(key)
+        if not df.empty:
+            df["datekey"] = pd.to_datetime(df["datekey"])
+            df["calendardate"] = pd.to_datetime(df["calendardate"])
+        return df
+
+    def read_sharadar_tickers(self) -> pd.DataFrame:
+        """Read SHARADAR/TICKERS universe dim. Columns: ticker, name, sector, industry, ..."""
+        return self._read_parquet(f"{self.prefix}/sharadar/tickers.parquet")
+
+    def read_sharadar_sp500(self) -> pd.DataFrame:
+        """Read SHARADAR/SP500 membership history. Columns: ticker, date, action."""
+        key = f"{self.prefix}/sharadar/sp500.parquet"
+        df = self._read_parquet(key)
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"])
+        return df
+
+    def read_sharadar_actions(self) -> pd.DataFrame:
+        """Read SHARADAR/ACTIONS (splits, dividends, delistings)."""
+        key = f"{self.prefix}/sharadar/actions.parquet"
+        df = self._read_parquet(key)
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"])
+        return df
+
+    def read_sharadar_sep(
+        self,
+        start_year: int = 1997,
+        end_year: int = 2026,
+        max_workers: int = 12,
+    ) -> pd.DataFrame:
+        """
+        Read SHARADAR/SEP equity prices partitioned by year+month.
+        Columns: ticker, date, open, high, low, close, volume, dividends, lastupdated.
+        Split-adjusted — use this as the primary price source.
+        """
+        keys = [
+            f"{self.prefix}/sharadar/sep/year={y}/month={m:02d}/data.parquet"
+            for y in range(start_year, end_year + 1)
+            for m in range(1, 13)
+        ]
+        frames = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._read_parquet, k): k for k in keys}
+            for future in as_completed(futures):
+                chunk = future.result()
+                if not chunk.empty:
+                    frames.append(chunk)
+        if not frames:
+            return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True)
+        df["date"] = pd.to_datetime(df["date"])
+        return df.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+    def read_sharadar_daily(
+        self,
+        start_year: int = 1997,
+        end_year: int = 2026,
+        max_workers: int = 12,
+    ) -> pd.DataFrame:
+        """
+        Read SHARADAR/DAILY prices partitioned by year+month.
+        Columns: ticker, date, open, high, low, close, closeunadj, volume, dividends.
+        """
+        keys = [
+            f"{self.prefix}/sharadar/daily/year={y}/month={m:02d}/data.parquet"
+            for y in range(start_year, end_year + 1)
+            for m in range(1, 13)
+        ]
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        frames = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._read_parquet, k): k for k in keys}
+            for future in as_completed(futures):
+                chunk = future.result()
+                if not chunk.empty:
+                    frames.append(chunk)
+        if not frames:
+            return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True)
+        df["date"] = pd.to_datetime(df["date"])
+        return df.sort_values(["ticker", "date"]).reset_index(drop=True)
 
     # ------------------------------------------------------------------
     # Bars — write
@@ -106,23 +207,16 @@ class S3Client:
 
     def write_financials_batch(self, df: pd.DataFrame, max_workers: int = 20) -> None:
         """
-        Write financials in dual layout:
+        Write financials to by_ticker layout.
           by_ticker: financials/by_ticker/ticker={T}/data.parquet
-          by_time:   financials/by_time/year={Y}/data.parquet  (sorted by ticker)
         """
         if df.empty:
             return
 
         writes = []
-
         for ticker, chunk in df.groupby("ticker"):
             key = f"{self._financials_prefix}/by_ticker/ticker={ticker}/data.parquet"
             writes.append((key, chunk.drop(columns=["ticker"]).sort_values("filing_date")))
-
-        df["_year"] = pd.to_datetime(df["filing_date"]).dt.year
-        for year, chunk in df.groupby("_year"):
-            key = f"{self._financials_prefix}/by_time/year={year}/data.parquet"
-            writes.append((key, chunk.drop(columns=["_year"]).sort_values("ticker")))
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(self._write_parquet, chunk, key): key for key, chunk in writes}
@@ -131,11 +225,89 @@ class S3Client:
 
         logger.info(f"Wrote {len(df)} financials rows ({df['ticker'].nunique()} tickers) → {self._financials_prefix}/")
 
+    def build_financials_by_time(self, max_workers: int = 20) -> None:
+        """
+        Build by_time index from all by_ticker files in one pass.
+        Call once after a full backfill — much faster than reading later.
+
+        Layout: financials/by_time/year={Y}/data.parquet
+        """
+        prefix = f"{self._financials_prefix}/by_ticker/"
+        paginator = self._s3.get_paginator("list_objects_v2")
+        keys = [
+            obj["Key"]
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix)
+            for obj in page.get("Contents", [])
+        ]
+
+        logger.info(f"Building by_time index from {len(keys)} by_ticker files...")
+
+        frames = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._read_parquet, key): key for key in keys}
+            for future in as_completed(futures):
+                key = futures[future]
+                chunk = future.result()
+                if not chunk.empty:
+                    ticker = key.split("ticker=")[-1].split("/")[0]
+                    chunk.insert(0, "ticker", ticker)
+                    frames.append(chunk)
+
+        if not frames:
+            logger.warning("No by_ticker data found.")
+            return
+
+        df = pd.concat(frames, ignore_index=True)
+        df["filing_date"] = pd.to_datetime(df["filing_date"])
+
+        writes = []
+        for year, chunk in df.groupby(df["filing_date"].dt.year):
+            key = f"{self._financials_prefix}/by_time/year={year}/data.parquet"
+            writes.append((key, chunk.sort_values("ticker").reset_index(drop=True)))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._write_parquet, chunk, key): key for key, chunk in writes}
+            for future in as_completed(futures):
+                future.result()
+
+        logger.info(f"Built {len(writes)} by_time files → {df['ticker'].nunique()} tickers")
+
+    def read_financials_all(self, max_workers: int = 20) -> pd.DataFrame:
+        """
+        Read all financials from by_time layout (fast — one file per year).
+        Run build_financials_by_time() first if by_time is stale.
+        """
+        prefix = f"{self._financials_prefix}/by_time/"
+        paginator = self._s3.get_paginator("list_objects_v2")
+        keys = [
+            obj["Key"]
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix)
+            for obj in page.get("Contents", [])
+        ]
+
+        if not keys:
+            return pd.DataFrame()
+
+        frames = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._read_parquet, key): key for key in keys}
+            for future in as_completed(futures):
+                chunk = future.result()
+                if not chunk.empty:
+                    frames.append(chunk)
+
+        if not frames:
+            return pd.DataFrame()
+
+        df = pd.concat(frames, ignore_index=True)
+        df["filing_date"] = pd.to_datetime(df["filing_date"])
+        return df.sort_values(["ticker", "filing_date"]).reset_index(drop=True)
+
     def read_daily_all(
         self,
-        start_year: int = 2016,
+        start_year: int = 1997,
         end_year: int = 2026,
-        max_workers: int = 16,
+        max_workers: int = 10,
     ) -> pd.DataFrame:
         """
         Read all daily bars from the daily layout in parallel.
@@ -167,24 +339,38 @@ class S3Client:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         return df.sort_values(["timestamp", "ticker"]).reset_index(drop=True)
 
-    def read_financials_all(self, start_year: int = 2016, end_year: int = 2025) -> pd.DataFrame:
+    def read_financials_all(self, max_workers: int = 20) -> pd.DataFrame:
         """
-        Read all financials from by_time layout — one S3 read per year.
-        Much faster than read_financials() for cross-sectional analysis.
+        Read all financials by scanning by_ticker layout in parallel.
         """
+        prefix = f"{self._financials_prefix}/by_ticker/"
+        paginator = self._s3.get_paginator("list_objects_v2")
+        keys = [
+            obj["Key"]
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix)
+            for obj in page.get("Contents", [])
+        ]
+
+        if not keys:
+            return pd.DataFrame()
+
         frames = []
-        for year in range(start_year, end_year + 1):
-            key = f"{self._financials_prefix}/by_time/year={year}/data.parquet"
-            chunk = self._read_parquet(key)
-            if not chunk.empty:
-                frames.append(chunk)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._read_parquet, key): key for key in keys}
+            for future in as_completed(futures):
+                key = futures[future]
+                chunk = future.result()
+                if not chunk.empty:
+                    ticker = key.split("ticker=")[-1].split("/")[0]
+                    chunk.insert(0, "ticker", ticker)
+                    frames.append(chunk)
 
         if not frames:
             return pd.DataFrame()
 
         df = pd.concat(frames, ignore_index=True)
         df["filing_date"] = pd.to_datetime(df["filing_date"])
-        return df
+        return df.sort_values(["ticker", "filing_date"]).reset_index(drop=True)
 
     def read_financials(self, tickers: List[str], start: str = None, end: str = None) -> pd.DataFrame:
         """

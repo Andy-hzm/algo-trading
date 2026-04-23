@@ -5,3 +5,5 @@ pyarrow
 boto3
 ipykernel
 yfinance
+statsmodels
+nasdaq-data-link

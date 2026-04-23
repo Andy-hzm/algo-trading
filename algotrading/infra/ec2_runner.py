@@ -86,8 +86,11 @@ class EC2Runner:
         response = self._ssm.send_command(
             InstanceIds=[self.instance_id],
             DocumentName="AWS-RunShellScript",
-            Parameters={"commands": commands},
-            TimeoutSeconds=timeout,
+            Parameters={
+                "commands": commands,
+                "executionTimeout": [str(timeout)],
+            },
+            TimeoutSeconds=min(timeout, 3600),  # delivery timeout capped at 1h
         )
         self._stream_output(response["Command"]["CommandId"], timeout)
 
